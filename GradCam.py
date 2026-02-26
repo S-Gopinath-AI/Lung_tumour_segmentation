@@ -1,64 +1,103 @@
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-
-model_path = r"E:\Lung Tumour Segmentation\lung_tumor_classification_model.h5"
-model = load_model(model_path)
-print("Model Loaded Successfully!")
-
-
-
-#Loading the image for the classification
-from tensorflow.keras.preprocessing.image import img_to_array, load_img
 import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
-img_path=r"E:\Lung Tumour Segmentation\images (1).jfif"
-loaded_img=load_img(img_path,target_size=(224,224))
-img_array=img_to_array(loaded_img)
-img_array=img_array/255.0
-input_array=np.expand_dims(img_array,axis=0)
+model = tf.keras.models.load_model("lung_densenet_model.keras")
+00
+# calling dummy
+dummy = tf.zeros((1, 224, 224, 3))
+model(dummy)
 
-#Prediction
-predictions=model.predict(input_array)
-class_labels=['Bengin','Malignant','Normal']
-predicted_class_index=np.argmax(predictions,axis=1)[0]
-predicted_class_label=class_labels[predicted_class_index]   
-print(f"Predicted Class: {predicted_class_label}")
+base_model = model.layers[0]   
 
-model.summary()
+for layer in reversed(base_model.layers):
+    if "conv" in layer.name:
+        print("Last Conv Layer:", layer.name)
+        break
 
-#Grad Cam Visualization
-vgg_model=model.layers[0]
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
 
-last_conv_layer=vgg_model.get_layer('block5_conv3')
-grad_model = tf.keras.models.Model(
-    inputs=model.inputs,
-    outputs=[last_conv_layer.output, model.output]
+    base_model = model.layers[0]   
+    classifier_layer = model.layers[1:]  # GAP + Dense layers
+
+    # Creating model that outputs last conv layer
+    conv_model = tf.keras.models.Model(
+        base_model.input,
+        base_model.get_layer(last_conv_layer_name).output
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs = conv_model(img_array)
+        tape.watch(conv_outputs)
+
+        x = conv_outputs
+        for layer in classifier_layer:
+            x = layer(x)
+
+        predictions = x
+        class_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, class_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+
+    return heatmap.numpy()
+
+img_path = r"E:\AI\Lung Tumour Segmentation\test1.png"
+
+img = tf.keras.preprocessing.image.load_img(img_path, target_size=(224,224))
+img_array = tf.keras.preprocessing.image.img_to_array(img)
+img_array = np.expand_dims(img_array, axis=0) / 255.0
+
+#Prediction 
+preds=model.predict(img_array)
+class_index=np.argmax(preds[0])
+confidence=float(preds[0][class_index])
+class_names=["Bengin","Malignant","Normal"]
+label=class_names[class_index]
+print(f"predicted:{label}")
+print(f"confidence:{confidence*100:.2f}%")
+
+
+
+heatmap = make_gradcam_heatmap(
+    img_array,
+    model,
+    last_conv_layer_name="conv5_block16_concat"
 )
 
-
-#Compute the gradient of the top predicted class for our input image
-with tf.GradientTape() as tape:
-    conv_outputs,predictions=grad_model(input_array)
-    top_class_channel=predictions[:,predicted_class_index]  
-grads=tape.gradient(top_class_channel,conv_outputs)
-
-#pooling the gradients over all the axes
-pooled_grads=tf.reduce_mean(grads,axis=(0,1,2))
-
-#weught the feature map with the pooled gradients
-conv_outputs=conv_outputs[0]    
-heatmap=conv_outputs @ pooled_grads[...,tf.newaxis]
-heatmap=tf.squeeze(heatmap)
-heatmap=tf.maximum(heatmap,0)/tf.math.reduce_max(heatmap)
+#overlay heatmap
+import cv2
+import numpy as np
 import matplotlib.pyplot as plt
-plt.matshow(heatmap.numpy())
 
-#superimpose the heatmap on original image
-import cv2  
-heatmap=cv2.resize(heatmap.numpy(),(loaded_img.size[0],loaded_img.size[1]))
-heatmap=np.uint8(255*heatmap)
-heatmap=cv2.applyColorMap(heatmap,cv2.COLORMAP_JET)
-superimposed_img=heatmap*0.4 + np.array(loaded_img)
-cv2.imwrite(r"E:\Lung Tumour Segmentation\grad_cam_output.jpg",superimposed_img)
-import tensorflow as tf
+img = cv2.imread(img_path)
+img = cv2.resize(img, (224, 224))
 
+# Resize heatmap
+heatmap = cv2.resize(heatmap, (224, 224))
+
+# Normalize properly
+heatmap = np.maximum(heatmap, 0)
+heatmap /= (heatmap.max() + 1e-8)
+
+# Convert to 0-255
+heatmap = np.uint8(255 * heatmap)
+
+# Apply colormap
+heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+# Blend better (reduce intensity)
+superimposed_img = cv2.addWeighted(img, 0.6, heatmap_color, 0.4, 0)
+plt.title(f"Predicted: {label}")
+plt.imshow(cv2.cvtColor(superimposed_img, cv2.COLOR_BGR2RGB))
+plt.axis("off")
+
+plt.show()

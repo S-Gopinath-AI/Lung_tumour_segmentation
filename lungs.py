@@ -1,147 +1,191 @@
-
-import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
 import os
-dir=os.listdir('E:\\Lung Tumour Segmentation\\The IQ-OTHNCCD lung cancer dataset')
-print(dir)
-
-import splitfolders
-splitfolders.ratio('E:\\Lung Tumour Segmentation\\The IQ-OTHNCCD lung cancer dataset', output='Dataset', seed=42, ratio=(0.8, 0.1, 0.1))
-
-for split in ['train','test','val']:
-    path=f'E:/Lung Tumour Segmentation/Dataset/{split}'
-    print(f'{split.upper()} SET:')
-    for folder in os.listdir(path):
-         cls_path = os.path.join(path, folder)
-         print(f'  {folder}: {len(os.listdir(cls_path))} images')
-
-#Data Augumentation
-
+import numpy as np
+import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-train_datagen=ImageDataGenerator(
-    rotation_range=10,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.1,
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from sklearn.utils.class_weight import compute_class_weight
+
+# classes (keep names matching your folders)
+classes = ['Bengin cases', 'Malignant cases', 'Normal cases']
+
+# Better: apply augmentation to the whole training set, not per-class one-offs
+train_aug = ImageDataGenerator(
+    rotation_range=20,
+    width_shift_range=0.15,
+    height_shift_range=0.15,
+    zoom_range=0.2,
+    shear_range=0.15,
     horizontal_flip=True,
-    brightness_range=[0.8,1.2],
-    rescale=1./255
+    brightness_range=[0.8, 1.2],
+    fill_mode='nearest',
+    rescale=1.0 / 255
 )
-val_datagen=ImageDataGenerator(rescale=1./255)
-test_datagen=ImageDataGenerator(rescale=1./255)
 
-train_datagen=train_datagen.flow_from_directory(
-    'E:/Lung Tumour Segmentation/Dataset/train',
+val_datagen = ImageDataGenerator(rescale=1.0 / 255)
+test_datagen = ImageDataGenerator(rescale=1.0 / 255)
+
+train_gen = train_aug.flow_from_directory(
+    "E:/Lung Tumour Segmentation/Dataset/train/",
+    classes=classes,
     target_size=(224,224),
     batch_size=32,
-    class_mode='categorical'
+    class_mode='categorical',
+    shuffle=True
 )
-val_datagen=val_datagen.flow_from_directory(
-    'E:/Lung Tumour Segmentation/Dataset/val',
+
+val_gen = val_datagen.flow_from_directory(
+    "E:/Lung Tumour Segmentation/Dataset/val",
+    classes=classes,
     target_size=(224,224),
     batch_size=32,
-    class_mode='categorical'
+    class_mode='categorical',
+    shuffle=False
 )
-test_datagen=test_datagen.flow_from_directory(
-    'E:/Lung Tumour Segmentation/Dataset/test',
+
+test_gen = test_datagen.flow_from_directory(
+    "E:/Lung Tumour Segmentation/Dataset/test",
+    classes=classes,
     target_size=(224,224),
     batch_size=32,
-    class_mode='categorical'
+    class_mode='categorical',
+    shuffle=False
+)
+# Debug prints: ensure generators use the same class->index mapping
+print('Train class indices:', train_gen.class_indices)
+print('Val class indices:  ', val_gen.class_indices)
+print('Test class indices: ', test_gen.class_indices)
+#Class weights
+class_weights_array = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_gen.classes),
+    y=train_gen.classes
 )
 
-#Early Stopping
-from tensorflow.keras.callbacks import EarlyStopping,ModelCheckpoint
-early_stopping=EarlyStopping(
-    monitor='val_loss',
-    patience=3,
-    restore_best_weights=True
+class_weights = dict(enumerate(class_weights_array))
+print("Class Weights:", class_weights)
+print(np.bincount(val_gen.classes))
+
+early_stop = EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+
+# Reduce LR when a plateau is reached and save best model
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1)
+checkpoint = ModelCheckpoint('lung_tumour_model_best.keras', monitor='val_loss', save_best_only=True)
+
+from tensorflow.keras import layers,models
+from tensorflow.keras.layers import Dropout
+def lung_tumour_model(input_shape=(224,224,3), num_classes=3):
+    inputs = layers.Input(shape=input_shape)
+
+    # Block 1
+    x = layers.Conv2D(32, (3,3), padding='same', use_bias=False)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.MaxPooling2D(2)(x)
+
+    # Block 2
+    x = layers.Conv2D(64, (3,3), padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.MaxPooling2D(2)(x)
+
+    # Block 3
+    x = layers.Conv2D(128, (3,3), padding='same', use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.SpatialDropout2D(0.1)(x)
+    x = layers.MaxPooling2D(2)(x)
+
+    # Block 4 (Grad-CAM layer)
+    x = layers.Conv2D(128, (3,3), padding='same', use_bias=False, name="last_conv")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+
+    # Head
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+    return models.Model(inputs, outputs)
+model = lung_tumour_model()
+#model.summary()
+
+# Build a focal loss that incorporates class weights (alpha)
+alpha_for_loss = class_weights_array.astype(np.float32)
+
+def make_focal_loss(alpha=None, gamma=2.0):
+    alpha_tf = tf.constant(alpha, dtype=tf.float32) if alpha is not None else None
+    def focal_loss(y_true, y_pred):
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        # cross-entropy per sample
+        cross_entropy = -tf.reduce_sum(y_true * tf.math.log(y_pred), axis=-1)
+        # probability of the true class
+        probs = tf.reduce_sum(y_true * y_pred, axis=-1)
+        modulating = tf.pow(1.0 - probs, gamma)
+        if alpha_tf is not None:
+            alpha_factor = tf.reduce_sum(alpha_tf * y_true, axis=-1)
+            loss = alpha_factor * modulating * cross_entropy
+        else:
+            loss = modulating * cross_entropy
+        return tf.reduce_mean(loss)
+    return focal_loss
+
+focal = make_focal_loss(alpha=alpha_for_loss, gamma=2.0)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(1e-4),
+    loss=focal,
+    metrics=['accuracy', tf.keras.metrics.Precision(name='prec'), tf.keras.metrics.Recall(name='rec')]
 )
 
-"""
-#Model Building
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D,MaxPooling2D,Dropout,Flatten,Dense
-model=Sequential([
-    Conv2D(32,(3,3),strides=(1,1),activation='relu',input_shape=(224,224,3),padding='same'),
-    MaxPooling2D(2,2),
-    Conv2D(64,(3,3),strides=(1,1),activation='relu',input_shape=(224,224,3),padding='same'),
-    MaxPooling2D(2,2),
-    Conv2D(128,(3,3),strides=(1,1),activation='relu',input_shape=(224,224,3),padding='same'),
-    MaxPooling2D(2,2),
-    Flatten(),
-    Dense(128,activation='relu'),
-    Dense(3,activation='softmax')
-])
-model.compile(optimizer='adam',loss='categorical_crossentropy',metrics=['accuracy'])
-history=model.fit(
-    train_datagen,
-    validation_data=val_datagen,
-    epochs=20,
-    callbacks=[early_stopping]
+#model Fitting
+# Callback to inspect validation predictions each epoch (helps debug collapse)
+class ValidationInspector(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        try:
+            preds = self.model.predict(val_gen, verbose=0)
+            pred_classes = np.argmax(preds, axis=1)
+            true = val_gen.classes
+            from sklearn.metrics import confusion_matrix, classification_report
+            cm = confusion_matrix(true, pred_classes)
+            counts = np.bincount(pred_classes, minlength=len(classes))
+            print(f"\n[Epoch {epoch+1}] Val pred distribution: {counts}")
+            print("Confusion matrix:\n", cm)
+            # per-class accuracy: diag / true counts (safe)
+            true_counts = cm.sum(axis=1).astype(float)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                per_class_acc = np.where(true_counts > 0, cm.diagonal() / true_counts, 0.0)
+            print("Per-class val acc:", np.round(per_class_acc, 3))
+        except Exception as e:
+            print('ValidationInspector error:', e)
+
+inspector = ValidationInspector()
+
+history = model.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=50,
+    class_weight=class_weights,
+    callbacks=[early_stop, reduce_lr, checkpoint, inspector]
 )
-test_loss,test_acc=model.evaluate(test_datagen)
-print("Accuracy:",test_acc)"""
 
-#VGG 16 Model
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense,Flatten,Dropout
-base_model=VGG16(weights='imagenet',include_top=False,input_shape=(224,224,3))
-base_model.trainable=False
-model=Sequential([
-    base_model,
-    Flatten(),
-    Dense(256,activation='relu'),
-    Dropout(0.5),
-    Dense(3,activation='softmax')
-])
+loss, acc = model.evaluate(test_gen)
+print("Test Accuracy:", acc)
+print("Test Loss:", loss)
 
-model.compile(optimizer='adam',loss='categorical_crossentropy',metrics=['accuracy'])
-history=model.fit(
-    train_datagen,
-    validation_data=val_datagen,
-    epochs=20,
-    callbacks=[early_stopping],
-    verbose=1
-)
-test_loss,test_acc=model.evaluate(test_datagen)
-print("Accuracy:",test_acc)
+#Generate Predictions
+import numpy as np
 
-#Save the model
-model.save('lung_tumor_classification_model.h5')
+pred_probs = model.predict(test_gen)
+pred_classes = np.argmax(pred_probs, axis=1)
+true_classes = test_gen.classes
 
-#Grad Cam Visualization
-"""import cv2
-img_path="E:\\Lung Tumour Segmentation\\Dataset\\test\\Malignant cases\\Malignant case (6).jpg"
-img=cv2.imread(img_path)
-img_resized=cv2.resize(img,(224,224))
-img_normalized=img_resized/255.0
-input_array=np.expand_dims(img_normalized,axis=0)  
+#confusion Matrix
+from sklearn.metrics import classification_report, confusion_matrix
 
-#Last conv layer
-last_conv_layer=model.get_layer('conv2d_2')
-grad_model=tf.keras.models.Model([model.inputs],[last_conv_layer.output,model.output])  
+print(classification_report(true_classes, pred_classes, target_names=list(test_gen.class_indices.keys())))
 
-#Compute the gradients
-with tf.GradientTape() as Tape: 
-    conv_outputs,predictions=grad_model(input_array)
-    predicted_class=tf.argmax(predictions[0])
-    tape.watch(conv_outputs)
-gradients=Tape.gradient(predictions[:,predicted_class],conv_outputs)
-weights=tf.reduce_mean(gradients,axis=(0,1,2))
-cam=tf.reduce_sum(tf.multiply(weights,conv_outputs),axis=-1).numpy()
-cam=tf.nn.relu(cam)
+print(confusion_matrix(true_classes, pred_classes))
 
-heatmap=cam/tf.reduce_max(cam)
-heatmap=heatmap.numpy()
-
-heatmap=cv2.resize(heatmap,(img.shape[1],img.shape[0]))
-heatmap=np.uint8(255*heatmap)
-heatmap=cv2.applyColorMap(heatmap,cv2.COLORMAP_JET)
-
-#Superimpose the heatmap on original image
-superimposed_img=cv2.addWeighted(img,0.6,heatmap,0.4,0)
-cv2.imshow('Grad-CAM',superimposed_img)
-cv2.waitKey(120)
-cv2.destroyAllWindows()"""
+#save model
+model.save("lung_tumour_model.keras")
